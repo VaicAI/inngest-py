@@ -186,14 +186,15 @@ class Inngest:
             if d.get("ts") == 0:
                 d["ts"] = int(time.time() * 1000)
             body.append(d)
-
-        return self._http_client_sync.build_request(
+        request = self._http_client_sync.build_request(
             "POST",
             url,
             headers=headers,
             json=body,
             timeout=30,
         )
+        print(f"URL: {url} {request.url}")
+        return request
 
     def add_middleware(
         self,
