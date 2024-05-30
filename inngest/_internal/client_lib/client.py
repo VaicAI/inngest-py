@@ -52,6 +52,10 @@ class Inngest:
     @property
     def signing_key_fallback(self) -> typing.Optional[str]:
         return self._signing_key_fallback
+    
+    @property
+    def custom_event_api_origin(self) -> typing.Optional[str]:
+        return self._custom_event_api_origin
 
     def __init__(
         self,
@@ -67,6 +71,7 @@ class Inngest:
             list[middleware_lib.UninitializedMiddleware]
         ] = None,
         signing_key: typing.Optional[str] = None,
+        custom_event_api_origin: typing.Optional[str] = None,
     ) -> None:
         """
         Args:
@@ -83,6 +88,7 @@ class Inngest:
             logger: Logger to use.
             middleware: List of middleware to use.
             signing_key: Inngest signing key.
+            custom_event_api_origin: Origin for a custom event API. Used when the events api is not being served from the root or the origin and instead a subdirectory
         """
 
         self.app_id = app_id
@@ -134,7 +140,7 @@ class Inngest:
             else:
                 event_origin = const.DEFAULT_EVENT_ORIGIN
         self._event_api_origin = event_origin
-
+        self._custom_event_api_origin = custom_event_api_origin
         self._http_client = net.ThreadAwareAsyncHTTPClient().initialize()
         self._http_client_sync = httpx.Client()
 
@@ -151,7 +157,10 @@ class Inngest:
             else:
                 return errors.EventKeyUnspecifiedError()
 
-        url = urllib.parse.urljoin(self._event_api_origin, f"/e/{event_key}")
+        if self._custom_event_api_origin is not None:
+            url = urllib.parse.urljoin(self._custom_event_api_origin, f"e/{event_key}")
+        else:
+            url = urllib.parse.urljoin(self._event_api_origin, f"/e/{event_key}")
 
         # The client is irrespective of framework.
         framework = None
