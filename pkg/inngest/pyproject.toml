@@ -34,4 +34,4 @@ inngest = ["py.typed"]
 
 [tool.setuptools]
 packages = ["inngest"]
-package-dir = { "" = "pkg/inngest/inngest" }
+package-dir = { "inngest": "pkg/inngest/inngest" }
