@@ -31,3 +31,7 @@ dependencies = [
 [tool.setuptools.package-data]
 # Makes py.typed appear when users install the inngest package.
 inngest = ["py.typed"]
+
+[tool.setuptools]
+packages = ["inngest"]
+package-dir = { "" = "pkg/inngest/inngest" }
