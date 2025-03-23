@@ -1,16 +1,28 @@
 """
-DigitalOcean integration for Inngest
+DigitalOcean integration for Inngest (Revised for proper registration)
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import typing
 import urllib.parse
 
-from ._internal import client_lib, comm_lib, errors, function, server_lib, types
+from ._internal import (
+    client_lib,
+    comm,
+    config_lib,
+    const,
+    errors,
+    execution,
+    function,
+    net,
+    transforms,
+    types,
+)
 
-FRAMEWORK = server_lib.Framework.DIGITAL_OCEAN
+FRAMEWORK = const.Framework.DIGITAL_OCEAN
 
 
 def serve(
@@ -22,25 +34,28 @@ def serve(
 ) -> typing.Callable[[dict[str, object], _Context], _Response]:
     """
     Serve Inngest functions in a DigitalOcean Function.
-
+    
+    This integration now supports the PUT endpoint for registering functions,
+    similar to the FastAPI integration.
+    
     Args:
-    ----
         client: Inngest client.
         functions: List of functions to serve.
-
         serve_origin: Origin to serve the functions from.
-        serve_path: The entire function path (e.g. /api/v1/web/fn-b094417f/sample/hello).
+        serve_path: The full function path.
     """
-
-    handler = comm_lib.CommHandler(
+    handler = comm.CommHandler(
+        api_base_url=client.api_origin,
         client=client,
         framework=FRAMEWORK,
         functions=functions,
     )
 
     def main(event: dict[str, object], context: _Context) -> _Response:
+        server_kind: typing.Optional[const.ServerKind] = None
+
         try:
-            if "http" not in event:
+            if not (isinstance(event, dict) and "http" in event):
                 raise errors.BodyInvalidError('missing "http" key in event')
 
             http = _EventHTTP.from_raw(event["http"])
@@ -49,107 +64,86 @@ def serve(
 
             if http.headers is None:
                 raise errors.BodyInvalidError(
-                    'missing "headers" event.http; have you set "web: raw"?'
+                    'missing "headers" in event.http; have you set "web: raw"?'
                 )
             if http.queryString is None:
                 raise errors.BodyInvalidError(
-                    'missing "queryString" event.http; have you set "web: raw"?'
+                    'missing "queryString" in event.http; have you set "web: raw"?'
                 )
 
+            headers = net.normalize_headers(http.headers)
+            _server_kind = transforms.get_server_kind(headers)
+            if not isinstance(_server_kind, Exception):
+                server_kind = _server_kind
+            else:
+                client.logger.error(_server_kind)
+                server_kind = None
+
+            body = _to_body_bytes(http.body)
             query_params = urllib.parse.parse_qs(http.queryString)
 
-            # DigitalOcean does not give the full path to the function, so we'll
-            # build it by hardcoding the path prefix ("api/v1/web") and
-            # concatenating it with the function name. This should be identical
-            # to the path, but DigitalOcean may change this in the future (e.g.
-            # a new API version).
-            #
-            # You might be tempted to use event.http.path, but that's actually
-            # the relative path after the prefix + function name.
+            # DigitalOcean does not give the full function path.
+            # We build it by hardcoding a prefix and appending the function name.
             path = "/api/v1/web" + context.function_name
-
             request_url = urllib.parse.urljoin(context.api_host, path)
 
-            comm_req = comm_lib.CommRequest(
-                body=_to_body_bytes(http.body),
-                headers=http.headers,
-                query_params=query_params,
-                raw_request={
-                    "context": context,
-                    "event": event,
-                },
+            comm_request = comm.CommRequest(
+                body=body,
+                headers=headers,
+                query_params={k: v[0] for k, v in query_params.items() if v},
+                raw_request=event,
                 request_url=request_url,
                 serve_origin=serve_origin,
                 serve_path=serve_path,
             )
 
             if http.method == "GET":
-                return _to_response(
-                    handler.get_sync(comm_req),
-                )
-
-            if http.method == "POST":
-                if http.body is None:
-                    raise errors.BodyInvalidError(
-                        'missing "body" event.http; have you set "web: raw"?'
-                    )
-
-                body = json.loads(http.body)
-                if not isinstance(body, dict):
-                    raise errors.BodyInvalidError("body must be an object")
-
-                # These are sent as query params but DigitalOcean munges them with the body
-                fn_id = _get_first(
-                    query_params.get(
-                        server_lib.QueryParamKey.FUNCTION_ID.value
+                res = handler.inspect(
+                    serve_origin=serve_origin,
+                    serve_path=serve_path,
+                    server_kind=server_kind,
+                    req_sig=net.RequestSignature(
+                        body=body,
+                        headers=headers,
+                        mode=client._mode,
                     ),
                 )
-                step_id = _get_first(
-                    query_params.get(server_lib.QueryParamKey.STEP_ID.value),
-                )
+                return _to_response(client, res, server_kind)
 
-                if fn_id is None:
-                    raise errors.QueryParamMissingError(
-                        server_lib.QueryParamKey.FUNCTION_ID.value
-                    )
-                if step_id is None:
-                    raise errors.QueryParamMissingError(
-                        server_lib.QueryParamKey.STEP_ID.value
-                    )
-                call = server_lib.ServerRequest.from_raw(body)
-                if isinstance(call, Exception):
-                    raise call
-
-                return _to_response(
-                    handler.post_sync(comm_req),
-                )
+            if http.method == "POST":
+                res = handler.post(comm_request)
+                return _to_response(client, res, server_kind)
 
             if http.method == "PUT":
-                # DigitalOcean does not give the full path to the function, so
-                # we'll build it by hardcoding the path prefix ("api/v1/web")
-                # and concatenating it with the function name. This should be
-                # identical to the path, but DigitalOcean may change this in the
-                # future (e.g. a new API version).
-                #
-                # You might be tempted to use event.http.path, but that's
-                # actually the relative path after the prefix + function name.
-                path = "/api/v1/web" + context.function_name
+                # Extract sync_id from the query parameters (if provided)
+                sync_id = query_params.get(const.QueryParamKey.SYNC_ID.value, [None])[0]
 
-                request_url = urllib.parse.urljoin(context.api_host, path)
-
-                return _to_response(
-                    handler.put_sync(comm_req),
+                # Build the application URL using a helper (mirroring FastAPI)
+                app_url = net.create_serve_url(
+                    request_url=request_url,
+                    serve_origin=serve_origin,
+                    serve_path=serve_path,
                 )
 
+                # Run the registration call. FastAPI awaits handler.register,
+                # so here we use asyncio.run to block on the async call.
+                res = asyncio.run(
+                    handler.register(
+                        app_url=app_url,
+                        server_kind=server_kind,
+                        sync_id=sync_id,
+                    )
+                )
+                return _to_response(client, res, server_kind)
+
             raise Exception(f"unsupported method: {http.method}")
+
         except Exception as e:
-            comm_res = comm_lib.CommResponse.from_error(client.logger, e)
-            if isinstance(
-                e, (errors.BodyInvalidError, errors.QueryParamMissingError)
-            ):
+            comm_res = comm.CommResponse.from_error(client.logger, e)
+            if isinstance(e, (errors.BodyInvalidError, errors.QueryParamMissingError)):
                 comm_res.status_code = 400
 
-            return _to_response(comm_res)
+            return _to_response(client, comm_res, server_kind)
 
     return main
 
@@ -169,11 +163,20 @@ def _to_body_bytes(body: typing.Optional[str]) -> bytes:
 
 
 def _to_response(
-    comm_res: comm_lib.CommResponse,
+    client: client_lib.Inngest,
+    comm_res: comm.CommResponse,
+    server_kind: typing.Union[const.ServerKind, None],
 ) -> _Response:
     return {
         "body": comm_res.body,  # type: ignore
-        "headers": comm_res.headers,
+        "headers": {
+            **comm_res.headers,
+            **net.create_headers(
+                env=client.env,
+                framework=FRAMEWORK,
+                server_kind=server_kind,
+            ),
+        },
         "statusCode": comm_res.status_code,
     }
 
@@ -187,10 +190,10 @@ class _EventHTTP(types.BaseModel):
 
 
 class _Context(typing.Protocol):
-    # E.g. "https://faas-nyc1-2ef2e6cc.doserverless.co"
+    # For example: "https://faas-nyc1-2ef2e6cc.doserverless.co"
     api_host: str
 
-    # E.g. "/fn-b094417f/sample/hello"
+    # For example: "/fn-b094417f/sample/hello"
     function_name: str
 
 
